@@ -422,15 +422,37 @@ func (m *MonitoringModule) ProcessResponse(resp *http.Response) error {
 	}
 	
 	if m.captureResponseBodies && resp.Body != nil {
-		bodyBytes, err := io.ReadAll(resp.Body)
+		// Check if the response is compressed
+		encoding := resp.Header.Get("Content-Encoding")
+		
+		var reader io.Reader = resp.Body
+		
+		// Decompress gzip if needed
+		if encoding == "gzip" {
+			gzipReader, err := gzip.NewReader(resp.Body)
+			if err != nil {
+				log.Printf("[Monitor] Warning: Failed to decompress gzip response: %v", err)
+				reader = resp.Body
+			} else {
+				reader = gzipReader
+				defer gzipReader.Close()
+			}
+		}
+		
+		// Read the (potentially decompressed) body
+		bodyBytes, err := io.ReadAll(reader)
 		if err == nil {
+			// Restore the body for other modules/handlers
 			resp.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
 			
+			// Only capture text content
 			if !isBinaryContent(bodyBytes) && len(bodyBytes) <= m.maxBodySize {
 				entry.ResponseBody = string(bodyBytes)
 			} else if len(bodyBytes) > m.maxBodySize {
 				entry.ResponseBody = string(bodyBytes[:m.maxBodySize]) + 
 					fmt.Sprintf("... [truncated, %d more bytes]", len(bodyBytes)-m.maxBodySize)
+			} else {
+				entry.ResponseBody = fmt.Sprintf("[Binary content, %d bytes]", len(bodyBytes))
 			}
 		}
 	}
@@ -441,6 +463,7 @@ func (m *MonitoringModule) ProcessResponse(resp *http.Response) error {
 	
 	return nil
 }
+
 
 func cloneHeaders(h http.Header) map[string][]string {
 	clone := make(map[string][]string)
