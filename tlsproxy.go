@@ -1,5 +1,22 @@
 package main
 
+/*
+TLS Intercepting Proxy with Web Monitor - Educational Overview
+
+This proxy acts as a "man-in-the-middle" to inspect HTTPS traffic. Here's how TLS normally works:
+1. Client connects to server and they establish an encrypted tunnel using TLS
+2. All data is encrypted so nobody in between can read it
+3. This is great for security but makes debugging difficult
+
+This proxy solves the debugging problem by:
+1. Acting as a fake server to the client (using certificates we generate)
+2. Acting as a real client to the actual server
+3. Decrypting traffic from client, inspecting it, then re-encrypting to server
+4. This only works if the client trusts our Certificate Authority (CA)
+
+NEW: Web-based monitor on port 4040 shows all intercepted traffic in real-time!
+*/
+
 import (
 	"bufio"
 	"bytes"
@@ -9,11 +26,11 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"flag"
 	"fmt"
+	"html"
 	"io"
 	"log"
 	"math/big"
@@ -24,6 +41,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -40,14 +58,13 @@ type ProxyConfig struct {
 	CertDir     string
 	LogFile     string
 	SkipInstall bool
-	Verbose     bool
 }
 
 type CertConfig struct {
 	Organization      string
 	CommonName        string
 	ValidityYears     int
-	AIAURLs           string // Format: "ocsp_url|ca_issuer_url"
+	AIAURLs           string
 	CRLDistPoints     []string
 	OCSPServer        string
 	DefaultSANs       []string
@@ -127,17 +144,13 @@ func sanitizeForConsole(data string) string {
 	result.Grow(len(data))
 	
 	for _, r := range data {
-		// Allow printable ASCII, newline, tab, and carriage return
 		if r == '\n' || r == '\r' || r == '\t' {
 			result.WriteRune(r)
 		} else if r >= 32 && r < 127 {
-			// Printable ASCII
 			result.WriteRune(r)
 		} else if r >= 128 {
-			// Unicode characters (keep them)
 			result.WriteRune(r)
 		} else {
-			// Replace control characters with hex notation
 			result.WriteString(fmt.Sprintf("\\x%02x", r))
 		}
 	}
@@ -145,13 +158,11 @@ func sanitizeForConsole(data string) string {
 	return result.String()
 }
 
-// isBinaryContent checks if content appears to be binary
 func isBinaryContent(data []byte) bool {
 	if len(data) == 0 {
 		return false
 	}
 	
-	// Sample first 512 bytes
 	sampleSize := 512
 	if len(data) < sampleSize {
 		sampleSize = len(data)
@@ -170,13 +181,871 @@ func isBinaryContent(data []byte) bool {
 		}
 	}
 	
-	// If more than 10% null bytes or 30% control chars, consider binary
 	return nullCount > sampleSize/10 || controlCount > sampleSize*3/10
+}
+
+// ==================== MONITORING MODULE ====================
+
+// TrafficEntry represents a captured HTTP request/response
+type TrafficEntry struct {
+	ID              int
+	Timestamp       time.Time
+	Method          string
+	URL             string
+	Host            string
+	Path            string
+	StatusCode      int
+	StatusText      string
+	RequestHeaders  map[string][]string
+	ResponseHeaders map[string][]string
+	RequestBody     string
+	ResponseBody    string
+	ContentType     string
+	Duration        time.Duration
+	TLSVersion      string
+	ClientAddr      string
+}
+
+// TrafficStore holds all captured traffic with thread-safe access
+type TrafficStore struct {
+	sync.RWMutex
+	entries    []TrafficEntry
+	nextID     int
+	maxEntries int
+}
+
+var trafficStore = &TrafficStore{
+	entries:    make([]TrafficEntry, 0),
+	nextID:     1,
+	maxEntries: 1000,
+}
+
+func (ts *TrafficStore) AddEntry(entry TrafficEntry) {
+	ts.Lock()
+	defer ts.Unlock()
+	
+	entry.ID = ts.nextID
+	ts.nextID++
+	
+	ts.entries = append(ts.entries, entry)
+	
+	if len(ts.entries) > ts.maxEntries {
+		ts.entries = ts.entries[len(ts.entries)-ts.maxEntries:]
+	}
+}
+
+func (ts *TrafficStore) GetEntries() []TrafficEntry {
+	ts.RLock()
+	defer ts.RUnlock()
+	
+	result := make([]TrafficEntry, len(ts.entries))
+	for i, entry := range ts.entries {
+		result[len(ts.entries)-1-i] = entry
+	}
+	
+	return result
+}
+
+func (ts *TrafficStore) GetEntry(id int) *TrafficEntry {
+	ts.RLock()
+	defer ts.RUnlock()
+	
+	for _, entry := range ts.entries {
+		if entry.ID == id {
+			return &entry
+		}
+	}
+	return nil
+}
+
+func (ts *TrafficStore) Clear() {
+	ts.Lock()
+	defer ts.Unlock()
+	
+	ts.entries = make([]TrafficEntry, 0)
+}
+
+// MonitoringModule captures traffic for the web interface
+type MonitoringModule struct {
+	captureRequestBodies  bool
+	captureResponseBodies bool
+	maxBodySize           int
+}
+
+func NewMonitoringModule() *MonitoringModule {
+	return &MonitoringModule{
+		captureRequestBodies:  true,
+		captureResponseBodies: true,
+		maxBodySize:           10240,
+	}
+}
+
+func (m *MonitoringModule) Name() string {
+	return "Monitor"
+}
+
+func (m *MonitoringModule) ShouldLog(req *http.Request) bool {
+	return true
+}
+
+func (m *MonitoringModule) ProcessRequest(req *http.Request) error {
+	return nil
+}
+
+func (m *MonitoringModule) ProcessResponse(resp *http.Response) error {
+	startTime := time.Now()
+	
+	entry := TrafficEntry{
+		Timestamp:       startTime,
+		Method:          resp.Request.Method,
+		URL:             resp.Request.URL.String(),
+		Host:            resp.Request.URL.Hostname(),
+		Path:            resp.Request.URL.Path,
+		StatusCode:      resp.StatusCode,
+		StatusText:      resp.Status,
+		RequestHeaders:  cloneHeaders(resp.Request.Header),
+		ResponseHeaders: cloneHeaders(resp.Header),
+		ContentType:     resp.Header.Get("Content-Type"),
+		ClientAddr:      "",
+	}
+	
+	if m.captureResponseBodies && resp.Body != nil {
+		bodyBytes, err := io.ReadAll(resp.Body)
+		if err == nil {
+			resp.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+			
+			if !isBinaryContent(bodyBytes) && len(bodyBytes) <= m.maxBodySize {
+				entry.ResponseBody = string(bodyBytes)
+			} else if len(bodyBytes) > m.maxBodySize {
+				entry.ResponseBody = string(bodyBytes[:m.maxBodySize]) + 
+					fmt.Sprintf("... [truncated, %d more bytes]", len(bodyBytes)-m.maxBodySize)
+			}
+		}
+	}
+	
+	entry.Duration = time.Since(startTime)
+	
+	trafficStore.AddEntry(entry)
+	
+	return nil
+}
+
+func cloneHeaders(h http.Header) map[string][]string {
+	clone := make(map[string][]string)
+	for k, v := range h {
+		clone[k] = append([]string{}, v...)
+	}
+	return clone
+}
+
+// ==================== MONITOR WEB SERVER ====================
+
+func StartMonitorServer(port int) {
+	http.HandleFunc("/", handleIndex)
+	http.HandleFunc("/api/entries", handleAPIEntries)
+	http.HandleFunc("/api/entry/", handleAPIEntry)
+	http.HandleFunc("/api/clear", handleAPIClear)
+	http.HandleFunc("/api/stats", handleAPIStats)
+	
+	addr := fmt.Sprintf(":%d", port)
+	log.Printf("[MONITOR] Starting monitor server on http://localhost%s", addr)
+	
+	go func() {
+		if err := http.ListenAndServe(addr, nil); err != nil {
+			log.Printf("[MONITOR] Server error: %v", err)
+		}
+	}()
+}
+
+func handleIndex(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	
+	htmlPage := `<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TLS Proxy Monitor</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: #1a1a1a;
+            color: #e0e0e0;
+            padding: 20px;
+        }
+        
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            padding: 25px;
+            border-radius: 12px;
+            margin-bottom: 25px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+        }
+        
+        .header h1 {
+            color: white;
+            font-size: 28px;
+            margin-bottom: 10px;
+        }
+        
+        .stats {
+            display: flex;
+            gap: 20px;
+            margin-top: 15px;
+            flex-wrap: wrap;
+        }
+        
+        .stat-box {
+            background: rgba(255,255,255,0.1);
+            padding: 12px 20px;
+            border-radius: 8px;
+            backdrop-filter: blur(10px);
+        }
+        
+        .stat-box .label {
+            font-size: 12px;
+            opacity: 0.8;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+        
+        .stat-box .value {
+            font-size: 24px;
+            font-weight: bold;
+            margin-top: 5px;
+        }
+        
+        .controls {
+            background: #2a2a2a;
+            padding: 20px;
+            border-radius: 12px;
+            margin-bottom: 20px;
+            display: flex;
+            gap: 15px;
+            flex-wrap: wrap;
+            align-items: center;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.3);
+        }
+        
+        .controls input[type="text"] {
+            flex: 1;
+            min-width: 250px;
+            padding: 10px 15px;
+            border: 2px solid #3a3a3a;
+            border-radius: 8px;
+            background: #1a1a1a;
+            color: #e0e0e0;
+            font-size: 14px;
+            transition: border-color 0.3s;
+        }
+        
+        .controls input[type="text"]:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+        
+        .controls button {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 8px;
+            background: #667eea;
+            color: white;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 600;
+            transition: all 0.3s;
+        }
+        
+        .controls button:hover {
+            background: #5568d3;
+            transform: translateY(-1px);
+        }
+        
+        .controls button.danger {
+            background: #e74c3c;
+        }
+        
+        .controls button.danger:hover {
+            background: #c0392b;
+        }
+        
+        .controls label {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            cursor: pointer;
+            user-select: none;
+        }
+        
+        .table-container {
+            background: #2a2a2a;
+            border-radius: 12px;
+            overflow: hidden;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+        }
+        
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        
+        thead {
+            background: #3a3a3a;
+        }
+        
+        th {
+            padding: 15px;
+            text-align: left;
+            font-weight: 600;
+            color: #b0b0b0;
+            text-transform: uppercase;
+            font-size: 12px;
+            letter-spacing: 1px;
+            border-bottom: 2px solid #4a4a4a;
+        }
+        
+        tbody tr {
+            border-bottom: 1px solid #3a3a3a;
+            transition: background 0.2s;
+            cursor: pointer;
+        }
+        
+        tbody tr:hover {
+            background: #333333;
+        }
+        
+        td {
+            padding: 15px;
+            font-size: 14px;
+        }
+        
+        .method {
+            font-weight: bold;
+            padding: 4px 10px;
+            border-radius: 6px;
+            display: inline-block;
+            font-size: 12px;
+        }
+        
+        .method.GET { background: #27ae60; color: white; }
+        .method.POST { background: #f39c12; color: white; }
+        .method.PUT { background: #3498db; color: white; }
+        .method.DELETE { background: #e74c3c; color: white; }
+        .method.PATCH { background: #9b59b6; color: white; }
+        
+        .status {
+            font-weight: bold;
+            padding: 4px 10px;
+            border-radius: 6px;
+            display: inline-block;
+            font-size: 12px;
+        }
+        
+        .status.success { background: #27ae60; color: white; }
+        .status.redirect { background: #3498db; color: white; }
+        .status.client-error { background: #e67e22; color: white; }
+        .status.server-error { background: #e74c3c; color: white; }
+        
+        .url {
+            color: #6eb5ff;
+            word-break: break-all;
+        }
+        
+        .timestamp {
+            color: #95a5a6;
+            font-size: 12px;
+        }
+        
+        .modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0,0,0,0.8);
+            z-index: 1000;
+            padding: 20px;
+            overflow-y: auto;
+        }
+        
+        .modal-content {
+            background: #2a2a2a;
+            max-width: 1200px;
+            margin: 40px auto;
+            border-radius: 12px;
+            padding: 30px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+        }
+        
+        .modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 25px;
+            padding-bottom: 15px;
+            border-bottom: 2px solid #3a3a3a;
+        }
+        
+        .modal-header h2 {
+            color: #667eea;
+        }
+        
+        .close-btn {
+            background: none;
+            border: none;
+            color: #95a5a6;
+            font-size: 32px;
+            cursor: pointer;
+            transition: color 0.3s;
+        }
+        
+        .close-btn:hover {
+            color: #e74c3c;
+        }
+        
+        .detail-section {
+            margin-bottom: 25px;
+        }
+        
+        .detail-section h3 {
+            color: #667eea;
+            margin-bottom: 12px;
+            font-size: 18px;
+        }
+        
+        .detail-grid {
+            display: grid;
+            grid-template-columns: 150px 1fr;
+            gap: 10px;
+            background: #1a1a1a;
+            padding: 15px;
+            border-radius: 8px;
+        }
+        
+        .detail-grid .label {
+            color: #95a5a6;
+            font-weight: 600;
+        }
+        
+        .detail-grid .value {
+            color: #e0e0e0;
+        }
+        
+        .headers-list {
+            background: #1a1a1a;
+            padding: 15px;
+            border-radius: 8px;
+            font-family: 'Courier New', monospace;
+            font-size: 13px;
+        }
+        
+        .header-item {
+            margin-bottom: 8px;
+            padding-bottom: 8px;
+            border-bottom: 1px solid #3a3a3a;
+        }
+        
+        .header-item:last-child {
+            border-bottom: none;
+        }
+        
+        .header-name {
+            color: #f39c12;
+            font-weight: bold;
+        }
+        
+        .header-value {
+            color: #95a5a6;
+            margin-left: 10px;
+        }
+        
+        .body-content {
+            background: #1a1a1a;
+            padding: 15px;
+            border-radius: 8px;
+            font-family: 'Courier New', monospace;
+            font-size: 13px;
+            max-height: 400px;
+            overflow-y: auto;
+            white-space: pre-wrap;
+            word-break: break-all;
+        }
+        
+        .empty-state {
+            text-align: center;
+            padding: 60px 20px;
+            color: #95a5a6;
+        }
+        
+        .empty-state-icon {
+            font-size: 64px;
+            margin-bottom: 20px;
+            opacity: 0.5;
+        }
+        
+        @media (max-width: 768px) {
+            .controls {
+                flex-direction: column;
+            }
+            
+            .controls input[type="text"] {
+                width: 100%;
+            }
+            
+            .stats {
+                flex-direction: column;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>🔒 TLS Proxy Monitor</h1>
+        <div class="stats">
+            <div class="stat-box">
+                <div class="label">Total Requests</div>
+                <div class="value" id="totalRequests">0</div>
+            </div>
+            <div class="stat-box">
+                <div class="label">Success Rate</div>
+                <div class="value" id="successRate">0%</div>
+            </div>
+            <div class="stat-box">
+                <div class="label">Avg Response Time</div>
+                <div class="value" id="avgTime">0ms</div>
+            </div>
+        </div>
+    </div>
+    
+    <div class="controls">
+        <input type="text" id="searchBox" placeholder="🔍 Search by URL, host, method, or status...">
+        <label>
+            <input type="checkbox" id="autoRefresh" checked>
+            Auto-refresh (2s)
+        </label>
+        <button onclick="loadEntries()">🔄 Refresh Now</button>
+        <button class="danger" onclick="clearEntries()">🗑️ Clear All</button>
+    </div>
+    
+    <div class="table-container">
+        <table>
+            <thead>
+                <tr>
+                    <th>Time</th>
+                    <th>Method</th>
+                    <th>Host</th>
+                    <th>Path</th>
+                    <th>Status</th>
+                    <th>Duration</th>
+                    <th>Type</th>
+                </tr>
+            </thead>
+            <tbody id="trafficTable">
+                <tr>
+                    <td colspan="7" class="empty-state">
+                        <div class="empty-state-icon">📡</div>
+                        <div>No traffic captured yet. Make some requests through the proxy!</div>
+                    </td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+    
+    <div id="detailModal" class="modal" onclick="closeModal(event)">
+        <div class="modal-content" onclick="event.stopPropagation()">
+            <div class="modal-header">
+                <h2>Request Details</h2>
+                <button class="close-btn" onclick="closeModal()">&times;</button>
+            </div>
+            <div id="modalBody"></div>
+        </div>
+    </div>
+    
+    <script>
+        let searchTerm = '';
+        let autoRefreshInterval = null;
+        
+        document.getElementById('searchBox').addEventListener('input', (e) => {
+            searchTerm = e.target.value.toLowerCase();
+            loadEntries();
+        });
+        
+        document.getElementById('autoRefresh').addEventListener('change', (e) => {
+            if (e.target.checked) {
+                startAutoRefresh();
+            } else {
+                stopAutoRefresh();
+            }
+        });
+        
+        function startAutoRefresh() {
+            if (!autoRefreshInterval) {
+                autoRefreshInterval = setInterval(loadEntries, 2000);
+            }
+        }
+        
+        function stopAutoRefresh() {
+            if (autoRefreshInterval) {
+                clearInterval(autoRefreshInterval);
+                autoRefreshInterval = null;
+            }
+        }
+        
+        async function loadEntries() {
+            try {
+                const response = await fetch('/api/entries');
+                const entries = await response.json();
+                
+                const filtered = entries.filter(entry => {
+                    if (!searchTerm) return true;
+                    return entry.URL.toLowerCase().includes(searchTerm) ||
+                           entry.Host.toLowerCase().includes(searchTerm) ||
+                           entry.Method.toLowerCase().includes(searchTerm) ||
+                           entry.StatusCode.toString().includes(searchTerm);
+                });
+                
+                renderTable(filtered);
+                updateStats(entries);
+            } catch (error) {
+                console.error('Failed to load entries:', error);
+            }
+        }
+        
+        function renderTable(entries) {
+            const tbody = document.getElementById('trafficTable');
+            
+            if (entries.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="7" class="empty-state"><div class="empty-state-icon">📡</div><div>No traffic captured yet. Make some requests through the proxy!</div></td></tr>';
+                return;
+            }
+            
+            tbody.innerHTML = entries.map(entry => {
+                const time = new Date(entry.Timestamp).toLocaleTimeString();
+                const statusClass = getStatusClass(entry.StatusCode);
+                const duration = entry.Duration ? (entry.Duration / 1000000).toFixed(0) + 'ms' : '-';
+                
+                return '<tr onclick="showDetails(' + entry.ID + ')"><td class="timestamp">' + time + '</td><td><span class="method ' + entry.Method + '">' + entry.Method + '</span></td><td>' + escapeHtml(entry.Host) + '</td><td class="url">' + escapeHtml(entry.Path) + '</td><td><span class="status ' + statusClass + '">' + (entry.StatusCode || '-') + '</span></td><td>' + duration + '</td><td>' + (entry.ContentType || '-') + '</td></tr>';
+            }).join('');
+        }
+        
+        function getStatusClass(code) {
+            if (code >= 200 && code < 300) return 'success';
+            if (code >= 300 && code < 400) return 'redirect';
+            if (code >= 400 && code < 500) return 'client-error';
+            if (code >= 500) return 'server-error';
+            return '';
+        }
+        
+        async function updateStats(entries) {
+            document.getElementById('totalRequests').textContent = entries.length;
+            
+            const successCount = entries.filter(e => e.StatusCode >= 200 && e.StatusCode < 300).length;
+            const successRate = entries.length > 0 ? ((successCount / entries.length) * 100).toFixed(1) : 0;
+            document.getElementById('successRate').textContent = successRate + '%';
+            
+            const avgDuration = entries.length > 0
+                ? entries.reduce((sum, e) => sum + (e.Duration || 0), 0) / entries.length / 1000000
+                : 0;
+            document.getElementById('avgTime').textContent = avgDuration.toFixed(0) + 'ms';
+        }
+        
+        async function showDetails(id) {
+            try {
+                const response = await fetch('/api/entry/' + id);
+                const entry = await response.json();
+                
+                if (!entry) {
+                    alert('Entry not found');
+                    return;
+                }
+                
+                const modalBody = document.getElementById('modalBody');
+                let html = '<div class="detail-section"><h3>Request Information</h3><div class="detail-grid">';
+                html += '<div class="label">Method:</div><div class="value"><span class="method ' + entry.Method + '">' + entry.Method + '</span></div>';
+                html += '<div class="label">URL:</div><div class="value">' + escapeHtml(entry.URL) + '</div>';
+                html += '<div class="label">Host:</div><div class="value">' + escapeHtml(entry.Host) + '</div>';
+                html += '<div class="label">Path:</div><div class="value">' + escapeHtml(entry.Path) + '</div>';
+                html += '<div class="label">Timestamp:</div><div class="value">' + new Date(entry.Timestamp).toLocaleString() + '</div>';
+                html += '</div></div>';
+                
+                if (entry.StatusCode) {
+                    html += '<div class="detail-section"><h3>Response Information</h3><div class="detail-grid">';
+                    html += '<div class="label">Status:</div><div class="value"><span class="status ' + getStatusClass(entry.StatusCode) + '">' + entry.StatusCode + ' ' + escapeHtml(entry.StatusText) + '</span></div>';
+                    html += '<div class="label">Content-Type:</div><div class="value">' + escapeHtml(entry.ContentType) + '</div>';
+                    html += '<div class="label">Duration:</div><div class="value">' + (entry.Duration ? (entry.Duration / 1000000).toFixed(2) + 'ms' : 'N/A') + '</div>';
+                    html += '</div></div>';
+                }
+                
+                html += '<div class="detail-section"><h3>Request Headers</h3><div class="headers-list">' + formatHeaders(entry.RequestHeaders) + '</div></div>';
+                
+                if (entry.ResponseHeaders) {
+                    html += '<div class="detail-section"><h3>Response Headers</h3><div class="headers-list">' + formatHeaders(entry.ResponseHeaders) + '</div></div>';
+                }
+                
+                if (entry.ResponseBody) {
+                    html += '<div class="detail-section"><h3>Response Body</h3><div class="body-content">' + escapeHtml(entry.ResponseBody) + '</div></div>';
+                }
+                
+                modalBody.innerHTML = html;
+                document.getElementById('detailModal').style.display = 'block';
+            } catch (error) {
+                console.error('Failed to load entry details:', error);
+                alert('Failed to load entry details');
+            }
+        }
+        
+        function formatHeaders(headers) {
+            if (!headers) return '<div style="color: #95a5a6;">No headers</div>';
+            
+            return Object.entries(headers).map(([name, values]) => {
+                const valueStr = Array.isArray(values) ? values.join(', ') : values;
+                return '<div class="header-item"><span class="header-name">' + escapeHtml(name) + ':</span><span class="header-value">' + escapeHtml(valueStr) + '</span></div>';
+            }).join('');
+        }
+        
+        function closeModal(event) {
+            if (!event || event.target.id === 'detailModal') {
+                document.getElementById('detailModal').style.display = 'none';
+            }
+        }
+        
+        async function clearEntries() {
+            if (!confirm('Are you sure you want to clear all captured traffic?')) {
+                return;
+            }
+            
+            try {
+                await fetch('/api/clear', { method: 'POST' });
+                loadEntries();
+            } catch (error) {
+                console.error('Failed to clear entries:', error);
+                alert('Failed to clear entries');
+            }
+        }
+        
+        function escapeHtml(text) {
+            if (!text) return '';
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+        
+        startAutoRefresh();
+        loadEntries();
+    </script>
+</body>
+</html>`
+	
+	fmt.Fprint(w, htmlPage)
+}
+
+func handleAPIEntries(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	entries := trafficStore.GetEntries()
+	json.NewEncoder(w).Encode(entries)
+}
+
+func handleAPIEntry(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	
+	idStr := strings.TrimPrefix(r.URL.Path, "/api/entry/")
+	var id int
+	fmt.Sscanf(idStr, "%d", &id)
+	
+	entry := trafficStore.GetEntry(id)
+	if entry == nil {
+		http.NotFound(w, r)
+		return
+	}
+	
+	json.NewEncoder(w).Encode(entry)
+}
+
+func handleAPIClear(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	
+	trafficStore.Clear()
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+func handleAPIStats(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	
+	entries := trafficStore.GetEntries()
+	
+	stats := map[string]interface{}{
+		"total":       len(entries),
+		"methods":     countByMethod(entries),
+		"statusCodes": countByStatusCode(entries),
+		"hosts":       countByHost(entries),
+	}
+	
+	json.NewEncoder(w).Encode(stats)
+}
+
+func countByMethod(entries []TrafficEntry) map[string]int {
+	counts := make(map[string]int)
+	for _, entry := range entries {
+		counts[entry.Method]++
+	}
+	return counts
+}
+
+func countByStatusCode(entries []TrafficEntry) map[int]int {
+	counts := make(map[int]int)
+	for _, entry := range entries {
+		if entry.StatusCode > 0 {
+			counts[entry.StatusCode]++
+		}
+	}
+	return counts
+}
+
+func countByHost(entries []TrafficEntry) []map[string]interface{} {
+	counts := make(map[string]int)
+	for _, entry := range entries {
+		counts[entry.Host]++
+	}
+	
+	type hostCount struct {
+		host  string
+		count int
+	}
+	var hosts []hostCount
+	for host, count := range counts {
+		hosts = append(hosts, hostCount{host, count})
+	}
+	sort.Slice(hosts, func(i, j int) bool {
+		return hosts[i].count > hosts[j].count
+	})
+	
+	result := make([]map[string]interface{}, 0)
+	for i, hc := range hosts {
+		if i >= 10 {
+			break
+		}
+		result = append(result, map[string]interface{}{
+			"host":  hc.host,
+			"count": hc.count,
+		})
+	}
+	
+	return result
 }
 
 // ==================== BUILT-IN LOGGING MODULES ====================
 
-// AllTrafficModule logs all traffic (default behavior)
 type AllTrafficModule struct{}
 
 func (m *AllTrafficModule) Name() string {
@@ -195,7 +1064,6 @@ func (m *AllTrafficModule) ProcessResponse(resp *http.Response) error {
 	return nil
 }
 
-// OAuthModule only logs OAuth/authentication flows
 type OAuthModule struct{}
 
 func (m *OAuthModule) Name() string {
@@ -206,7 +1074,6 @@ func (m *OAuthModule) ShouldLog(req *http.Request) bool {
 	url := req.URL.String()
 	path := strings.ToLower(req.URL.Path)
 	
-	// Check for OAuth patterns
 	oauthPatterns := []string{
 		"/oauth", "/auth", "/login", "/token", "/authorize",
 		"access_token", "refresh_token", "client_id", "client_secret",
@@ -221,7 +1088,6 @@ func (m *OAuthModule) ShouldLog(req *http.Request) bool {
 		}
 	}
 	
-	// Check Authorization header
 	if authHeader := req.Header.Get("Authorization"); authHeader != "" {
 		log.Printf("[OAuth] Detected Authorization header")
 		return true
@@ -238,7 +1104,6 @@ func (m *OAuthModule) ProcessResponse(resp *http.Response) error {
 	return nil
 }
 
-// DomainFilterModule only logs specific domains
 type DomainFilterModule struct {
 	Domains []string
 }
@@ -265,7 +1130,6 @@ func (m *DomainFilterModule) ProcessResponse(resp *http.Response) error {
 	return nil
 }
 
-// RequestModifierModule modifies requests (example: add headers)
 type RequestModifierModule struct {
 	AddHeaders    map[string]string
 	RemoveHeaders []string
@@ -280,13 +1144,11 @@ func (m *RequestModifierModule) ShouldLog(req *http.Request) bool {
 }
 
 func (m *RequestModifierModule) ProcessRequest(req *http.Request) error {
-	// Add custom headers
 	for key, value := range m.AddHeaders {
 		req.Header.Set(key, value)
 		log.Printf("[RequestModifier] Added header: %s: %s", key, value)
 	}
 	
-	// Remove headers
 	for _, key := range m.RemoveHeaders {
 		if req.Header.Get(key) != "" {
 			req.Header.Del(key)
@@ -301,7 +1163,6 @@ func (m *RequestModifierModule) ProcessResponse(resp *http.Response) error {
 	return nil
 }
 
-// ResponseModifierModule modifies responses
 type ResponseModifierModule struct {
 	AddHeaders    map[string]string
 	RemoveHeaders []string
@@ -320,13 +1181,11 @@ func (m *ResponseModifierModule) ProcessRequest(req *http.Request) error {
 }
 
 func (m *ResponseModifierModule) ProcessResponse(resp *http.Response) error {
-	// Add custom headers
 	for key, value := range m.AddHeaders {
 		resp.Header.Set(key, value)
 		log.Printf("[ResponseModifier] Added header: %s: %s", key, value)
 	}
 	
-	// Remove headers
 	for _, key := range m.RemoveHeaders {
 		if resp.Header.Get(key) != "" {
 			resp.Header.Del(key)
@@ -337,7 +1196,6 @@ func (m *ResponseModifierModule) ProcessResponse(resp *http.Response) error {
 	return nil
 }
 
-// PathFilterModule only logs specific URL paths
 type PathFilterModule struct {
 	Paths []string
 }
@@ -364,9 +1222,8 @@ func (m *PathFilterModule) ProcessResponse(resp *http.Response) error {
 	return nil
 }
 
-// StringReplacementModule replaces strings in request/response bodies
 type StringReplacementModule struct {
-	Replacements map[string]string // old -> new
+	Replacements map[string]string
 }
 
 func (m *StringReplacementModule) Name() string {
@@ -382,7 +1239,6 @@ func (m *StringReplacementModule) ProcessRequest(req *http.Request) error {
 		return nil
 	}
 
-	// Only process text content types
 	contentType := req.Header.Get("Content-Type")
 	if contentType != "" {
 		isText := strings.Contains(contentType, "text/") ||
@@ -392,19 +1248,16 @@ func (m *StringReplacementModule) ProcessRequest(req *http.Request) error {
 			strings.Contains(contentType, "application/javascript")
 		
 		if !isText {
-			// Not text content, skip replacement
 			return nil
 		}
 	}
 
-	// Handle Content-Encoding (decompress if needed)
 	var reader io.Reader = req.Body
 	encoding := req.Header.Get("Content-Encoding")
 	
 	if encoding == "gzip" {
 		gzipReader, err := gzip.NewReader(req.Body)
 		if err != nil {
-			// Not valid gzip, try reading as-is
 			log.Printf("[StringReplacement] Warning: Failed to decompress gzip request: %v", err)
 			reader = req.Body
 		} else {
@@ -413,16 +1266,13 @@ func (m *StringReplacementModule) ProcessRequest(req *http.Request) error {
 		}
 	}
 
-	// Read the body (decompressed if it was compressed)
 	bodyBytes, err := io.ReadAll(reader)
 	if err != nil {
 		return err
 	}
 
-	// Close the original body
 	req.Body.Close()
 
-	// Apply replacements
 	bodyStr := string(bodyBytes)
 	for old, new := range m.Replacements {
 		if strings.Contains(bodyStr, old) {
@@ -432,12 +1282,10 @@ func (m *StringReplacementModule) ProcessRequest(req *http.Request) error {
 		}
 	}
 
-	// Create new body with modified content (uncompressed)
 	req.Body = io.NopCloser(bytes.NewBufferString(bodyStr))
 	req.ContentLength = int64(len(bodyStr))
 	req.Header.Set("Content-Length", fmt.Sprintf("%d", len(bodyStr)))
 	
-	// Remove Content-Encoding since we're returning uncompressed data
 	if encoding != "" {
 		req.Header.Del("Content-Encoding")
 		log.Printf("[StringReplacement] Removed Content-Encoding: %s (returning uncompressed)", encoding)
@@ -451,7 +1299,6 @@ func (m *StringReplacementModule) ProcessResponse(resp *http.Response) error {
 		return nil
 	}
 
-	// Only process text content types
 	contentType := resp.Header.Get("Content-Type")
 	if contentType != "" {
 		isText := strings.Contains(contentType, "text/") ||
@@ -460,18 +1307,14 @@ func (m *StringReplacementModule) ProcessResponse(resp *http.Response) error {
 			strings.Contains(contentType, "application/javascript")
 		
 		if !isText {
-			// Not text content, skip replacement
 			return nil
 		}
 	}
 
-	// Handle Content-Encoding (decompress if needed)
 	encoding := resp.Header.Get("Content-Encoding")
 	
-	// Skip unsupported compression formats
 	if encoding == "br" || encoding == "zstd" || encoding == "deflate" {
-		log.Printf("[StringReplacement] Warning: Skipping response with unsupported compression: %s (only gzip is supported)", encoding)
-		log.Printf("[StringReplacement] Tip: To enable replacements, disable %s in browser or use Accept-Encoding header filter", encoding)
+		log.Printf("[StringReplacement] Warning: Skipping response with unsupported compression: %s", encoding)
 		return nil
 	}
 	
@@ -480,7 +1323,6 @@ func (m *StringReplacementModule) ProcessResponse(resp *http.Response) error {
 	if encoding == "gzip" {
 		gzipReader, err := gzip.NewReader(resp.Body)
 		if err != nil {
-			// Not valid gzip, try reading as-is
 			log.Printf("[StringReplacement] Warning: Failed to decompress gzip response: %v", err)
 			reader = resp.Body
 		} else {
@@ -489,16 +1331,13 @@ func (m *StringReplacementModule) ProcessResponse(resp *http.Response) error {
 		}
 	}
 
-	// Read the body (decompressed if it was compressed)
 	bodyBytes, err := io.ReadAll(reader)
 	if err != nil {
 		return err
 	}
 
-	// Close the original body
 	resp.Body.Close()
 
-	// Apply replacements
 	bodyStr := string(bodyBytes)
 	for old, new := range m.Replacements {
 		if strings.Contains(bodyStr, old) {
@@ -508,12 +1347,10 @@ func (m *StringReplacementModule) ProcessResponse(resp *http.Response) error {
 		}
 	}
 
-	// Create new body with modified content (uncompressed)
 	resp.Body = io.NopCloser(bytes.NewBufferString(bodyStr))
 	resp.ContentLength = int64(len(bodyStr))
 	resp.Header.Set("Content-Length", fmt.Sprintf("%d", len(bodyStr)))
 	
-	// Remove Content-Encoding since we're returning uncompressed data
 	if encoding != "" && encoding != "br" && encoding != "zstd" && encoding != "deflate" {
 		resp.Header.Del("Content-Encoding")
 		log.Printf("[StringReplacement] Removed Content-Encoding: %s (returning uncompressed)", encoding)
@@ -533,27 +1370,23 @@ func (m *ForceGzipModule) ShouldLog(req *http.Request) bool {
 }
 
 func (m *ForceGzipModule) ProcessRequest(req *http.Request) error {
-	// Get current Accept-Encoding
 	acceptEncoding := req.Header.Get("Accept-Encoding")
 	
 	if acceptEncoding == "" {
 		return nil
 	}
 	
-	// Remove br (Brotli), zstd, and deflate - keep only gzip
 	encodings := strings.Split(acceptEncoding, ",")
 	var supported []string
 	
 	for _, enc := range encodings {
 		enc = strings.TrimSpace(enc)
-		// Keep gzip and identity, remove others
 		if strings.Contains(enc, "gzip") || enc == "identity" {
 			supported = append(supported, enc)
 		}
 	}
 	
 	if len(supported) == 0 {
-		// If nothing left, request gzip explicitly
 		supported = []string{"gzip"}
 	}
 	
@@ -571,16 +1404,17 @@ func (m *ForceGzipModule) ProcessResponse(resp *http.Response) error {
 	return nil
 }
 
+// ==================== MAIN FUNCTION ====================
+
 func main() {
 	port := flag.Int("port", 8080, "Proxy port")
 	cleanup := flag.Bool("cleanup", false, "Remove CA certificates and exit")
 	certDir := flag.String("certdir", ".", "Certificate directory")
 	skipInstall := flag.Bool("skip-install", false, "Skip automatic certificate installation")
-	verbose := flag.Bool("verbose", false, "Show detailed cookie and session token information")
 	configFile := flag.String("config", "proxy-config.ini", "Configuration file path")
+	monitorPort := flag.Int("monitor-port", 4040, "Monitor web interface port")
 	flag.Parse()
 
-	// Load certificate configuration
 	certConfig = loadConfig(*configFile)
 
 	config := &ProxyConfig{
@@ -588,7 +1422,6 @@ func main() {
 		CertDir:     *certDir,
 		LogFile:     filepath.Join(*certDir, logFile),
 		SkipInstall: *skipInstall,
-		Verbose:     *verbose,
 	}
 
 	if *cleanup {
@@ -607,8 +1440,10 @@ func main() {
 	}
 	defer logWriter.Close()
 
-	// Initialize logging modules
 	initializeModules()
+
+	// Start monitoring web interface
+	StartMonitorServer(*monitorPort)
 
 	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", config.Port))
 	if err != nil {
@@ -617,26 +1452,9 @@ func main() {
 	defer listener.Close()
 
 	log.Printf("Proxy listening on port %d", config.Port)
+	log.Printf("Monitor interface: http://localhost:%d", *monitorPort)
 	log.Printf("CA certificate: %s", filepath.Join(config.CertDir, caCertFile))
 	log.Printf("Log file: %s", config.LogFile)
-	
-	if config.Verbose {
-		log.Printf("⚠️  VERBOSE MODE ENABLED - Session export active")
-		log.Printf("Sessions will be exported to: EditThisCookie_Sessions.json")
-		log.Printf("WARNING: This file will contain sensitive authentication data!")
-		
-		// Test write permissions
-		testFile := "EditThisCookie_Sessions.json"
-		testData := []EditThisCookieExport{}
-		if jsonData, err := json.MarshalIndent(testData, "", "    "); err == nil {
-			if err := os.WriteFile(testFile, jsonData, 0644); err == nil {
-				log.Printf("✓ Successfully initialized export file: %s", testFile)
-			} else {
-				log.Printf("❌ ERROR: Cannot write to %s: %v", testFile, err)
-				log.Printf("   Check directory permissions or run with different -certdir")
-			}
-		}
-	}
 
 	for {
 		conn, err := listener.Accept()
@@ -651,27 +1469,29 @@ func main() {
 func initializeModules() {
 	log.Println("Initializing logging modules...")
 	
+	// Register monitoring module FIRST to capture all traffic
+	RegisterModule(NewMonitoringModule())
+	
 	// Default: Log all traffic
 	RegisterModule(&AllTrafficModule{})
 	
 	// Uncomment to enable OAuth-only logging:
 	// RegisterModule(&OAuthModule{})
 	
-	// Uncomment to filter by domain (example: only log example.com and api.example.com):
+	// Uncomment to filter by domain:
 	// RegisterModule(&DomainFilterModule{
 	// 	Domains: []string{"example.com", "api.example.com"},
 	// })
 	
-	// Uncomment to filter by path (example: only log /api/ endpoints):
+	// Uncomment to filter by path:
 	// RegisterModule(&PathFilterModule{
 	// 	Paths: []string{"/api/", "/v1/"},
 	// })
 	
-	// Uncomment to modify requests (example: add custom headers):
+	// Uncomment to modify requests:
 	// RegisterModule(&RequestModifierModule{
 	// 	AddHeaders: map[string]string{
 	// 		"X-Proxy-Debug": "true",
-	// 		"X-Custom-Header": "value",
 	// 	},
 	// 	RemoveHeaders: []string{"User-Agent"},
 	// })
@@ -684,8 +1504,7 @@ func initializeModules() {
 	// 	RemoveHeaders: []string{"Server"},
 	// })
 	
-	// Uncomment to replace strings in request/response bodies:
-	// NOTE: Also enable ForceGzip module to handle Brotli compression
+	// Uncomment to replace strings:
 	// RegisterModule(&ForceGzipModule{})
 	// RegisterModule(&StringReplacementModule{
 	// 	Replacements: map[string]string{
@@ -718,18 +1537,15 @@ func loadConfig(configPath string) *CertConfig {
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
 		
-		// Skip comments and empty lines
 		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
 			continue
 		}
 
-		// Section header
 		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
 			currentSection = strings.Trim(line, "[]")
 			continue
 		}
 
-		// Key-value pair
 		parts := strings.SplitN(line, "=", 2)
 		if len(parts) != 2 {
 			continue
@@ -742,7 +1558,6 @@ func loadConfig(configPath string) *CertConfig {
 			continue
 		}
 
-		// Parse based on section and key
 		switch currentSection {
 		case "ca_certificate":
 			switch key {
@@ -844,13 +1659,11 @@ func generateCA(certPath, keyPath string, skipInstall bool) error {
 		MaxPathLen:            1,
 	}
 
-	// Add CRL Distribution Points if configured
 	if len(certConfig.CRLDistPoints) > 0 {
 		template.CRLDistributionPoints = certConfig.CRLDistPoints
 		log.Printf("CA CRL Distribution Points: %v", certConfig.CRLDistPoints)
 	}
 
-	// Add OCSP and CA Issuer URLs if configured
 	if certConfig.AIAURLs != "" {
 		parts := strings.Split(certConfig.AIAURLs, "|")
 		if len(parts) == 2 {
@@ -951,7 +1764,6 @@ func cleanupCerts(config *ProxyConfig) {
 	certPath := filepath.Join(config.CertDir, caCertFile)
 	keyPath := filepath.Join(config.CertDir, caKeyFile)
 
-	// Uninstall from system
 	log.Println("Removing certificate from system trust store...")
 	if err := uninstallCertificate(); err != nil {
 		log.Printf("WARNING: Failed to uninstall certificate: %v", err)
@@ -1012,11 +1824,9 @@ func handleConnect(clientConn net.Conn, req *http.Request, config *ProxyConfig) 
 		MinVersion:   tls.VersionTLS12,
 		MaxVersion:   tls.VersionTLS13,
 		CipherSuites: []uint16{
-			// TLS 1.3 cipher suites (automatically used for TLS 1.3)
 			tls.TLS_AES_128_GCM_SHA256,
 			tls.TLS_AES_256_GCM_SHA384,
 			tls.TLS_CHACHA20_POLY1305_SHA256,
-			// TLS 1.2 cipher suites
 			tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
 			tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
 			tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
@@ -1034,7 +1844,6 @@ func handleConnect(clientConn net.Conn, req *http.Request, config *ProxyConfig) 
 	}
 	defer tlsClientConn.Close()
 
-	// Log TLS version
 	state := tlsClientConn.ConnectionState()
 	tlsVersion := "unknown"
 	switch state.Version {
@@ -1067,11 +1876,6 @@ func handleConnect(clientConn net.Conn, req *http.Request, config *ProxyConfig) 
 			return
 		}
 
-		// Export response cookies if verbose mode
-		if config.Verbose {
-			exportResponseCookies(resp)
-		}
-
 		if err := resp.Write(tlsClientConn); err != nil {
 			log.Printf("Failed to write response: %v", err)
 			return
@@ -1098,11 +1902,6 @@ func handleHTTP(clientConn net.Conn, req *http.Request, config *ProxyConfig) {
 	}
 	defer resp.Body.Close()
 
-	// Export response cookies if verbose mode
-	if config.Verbose {
-		exportResponseCookies(resp)
-	}
-
 	resp.Write(clientConn)
 }
 
@@ -1111,11 +1910,9 @@ func forwardRequest(req *http.Request) (*http.Response, error) {
 		MinVersion: tls.VersionTLS12,
 		MaxVersion: tls.VersionTLS13,
 		CipherSuites: []uint16{
-			// TLS 1.3
 			tls.TLS_AES_128_GCM_SHA256,
 			tls.TLS_AES_256_GCM_SHA384,
 			tls.TLS_CHACHA20_POLY1305_SHA256,
-			// TLS 1.2
 			tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
 			tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
 			tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
@@ -1153,228 +1950,12 @@ func forwardRequest(req *http.Request) (*http.Response, error) {
 		return nil, err
 	}
 	
-	// Process response through modules
 	executeModulesResponse(resp)
 	
 	return resp, nil
 }
 
-// isJWT checks if a string looks like a JWT token
-func isJWT(token string) bool {
-	// JWT format: header.payload.signature
-	parts := strings.Split(token, ".")
-	return len(parts) == 3
-}
-
-// parseJWT attempts to decode and display JWT claims (header and payload only)
-func parseJWT(token string) string {
-	parts := strings.Split(token, ".")
-	if len(parts) != 3 {
-		return ""
-	}
-	
-	var result strings.Builder
-	result.WriteString("    [JWT Token Detected]\n")
-	
-	// Decode header
-	if headerJSON, err := base64Decode(parts[0]); err == nil {
-		result.WriteString(fmt.Sprintf("    JWT Header: %s\n", headerJSON))
-	}
-	
-	// Decode payload (claims)
-	if payloadJSON, err := base64Decode(parts[1]); err == nil {
-		result.WriteString(fmt.Sprintf("    JWT Payload: %s\n", payloadJSON))
-		
-		// Try to extract common claims
-		var claims map[string]interface{}
-		if err := json.Unmarshal([]byte(payloadJSON), &claims); err == nil {
-			if exp, ok := claims["exp"].(float64); ok {
-				expTime := time.Unix(int64(exp), 0)
-				result.WriteString(fmt.Sprintf("    Expires: %s\n", expTime.Format(time.RFC3339)))
-				if time.Now().After(expTime) {
-					result.WriteString("    Status: EXPIRED\n")
-				} else {
-					result.WriteString(fmt.Sprintf("    Status: Valid (expires in %s)\n", time.Until(expTime).Round(time.Second)))
-				}
-			}
-			if iss, ok := claims["iss"].(string); ok {
-				result.WriteString(fmt.Sprintf("    Issuer: %s\n", iss))
-			}
-			if sub, ok := claims["sub"].(string); ok {
-				result.WriteString(fmt.Sprintf("    Subject: %s\n", sub))
-			}
-			if aud, ok := claims["aud"]; ok {
-				result.WriteString(fmt.Sprintf("    Audience: %v\n", aud))
-			}
-			if iat, ok := claims["iat"].(float64); ok {
-				iatTime := time.Unix(int64(iat), 0)
-				result.WriteString(fmt.Sprintf("    Issued At: %s\n", iatTime.Format(time.RFC3339)))
-			}
-		}
-	}
-	
-	// Show partial signature (first 20 chars)
-	if len(parts[2]) > 20 {
-		result.WriteString(fmt.Sprintf("    Signature: %s...\n", parts[2][:20]))
-	} else {
-		result.WriteString(fmt.Sprintf("    Signature: %s\n", parts[2]))
-	}
-	
-	return result.String()
-}
-
-// base64Decode decodes base64url or standard base64
-func base64Decode(encoded string) (string, error) {
-	// JWT uses base64url encoding (no padding)
-	encoded = strings.ReplaceAll(encoded, "-", "+")
-	encoded = strings.ReplaceAll(encoded, "_", "/")
-	
-	// Add padding if needed
-	switch len(encoded) % 4 {
-	case 2:
-		encoded += "=="
-	case 3:
-		encoded += "="
-	}
-	
-	decoded, err := base64.StdEncoding.DecodeString(encoded)
-	if err != nil {
-		return "", err
-	}
-	
-	return string(decoded), nil
-}
-
-type EditThisCookieExport struct {
-	Domain         string  `json:"domain"`
-	ExpirationDate float64 `json:"expirationDate"`
-	HostOnly       bool    `json:"hostOnly"`
-	HttpOnly       bool    `json:"httpOnly"`
-	Name           string  `json:"name"`
-	Path           string  `json:"path"`
-	SameSite       string  `json:"sameSite"`
-	Secure         bool    `json:"secure"`
-	Session        bool    `json:"session"`
-	StoreId        string  `json:"storeId"`
-	Value          string  `json:"value"`
-}
-
-func exportToEditThisCookie(req *http.Request) {
-	// Disabled: Request cookies (Cookie header) only have name+value
-	// They lack: domain, path, expires, secure, httpOnly, sameSite flags
-	// Only Set-Cookie headers (responses) have complete cookie properties
-	// All exports now happen via exportResponseCookies()
-	return
-}
-
-func exportResponseCookies(resp *http.Response) {
-	if resp == nil || resp.Header == nil {
-		return
-	}
-
-	setCookies := resp.Cookies()
-	if len(setCookies) == 0 {
-		return
-	}
-
-	filename := "EditThisCookie_Sessions.json"
-	var exportData []EditThisCookieExport
-
-	// Read existing data if file exists
-	if data, err := os.ReadFile(filename); err == nil {
-		json.Unmarshal(data, &exportData)
-	}
-
-	// Create map for deduplication (key: name+domain)
-	cookieMap := make(map[string]EditThisCookieExport)
-	for _, existing := range exportData {
-		key := existing.Name + "|" + existing.Domain
-		cookieMap[key] = existing
-	}
-
-	// Convert Set-Cookie response cookies to EditThisCookie format
-	for _, cookie := range setCookies {
-		sameSite := "unspecified"
-		switch cookie.SameSite {
-		case http.SameSiteStrictMode:
-			sameSite = "strict"
-		case http.SameSiteLaxMode:
-			sameSite = "lax"
-		case http.SameSiteNoneMode:
-			sameSite = "no_restriction"
-		}
-
-		// Use cookie.Domain as-is (preserves leading dot)
-		domain := cookie.Domain
-		hostOnly := cookie.Domain == ""
-		
-		if domain == "" {
-			// Extract domain from response/request
-			if resp.Request != nil {
-				domain = resp.Request.URL.Hostname()
-				if domain == "" {
-					domain = resp.Request.Host
-				}
-			}
-			log.Printf("[EXPORT] Response cookie '%s' has no domain, using: %s (hostOnly: true)", cookie.Name, domain)
-		} else {
-			log.Printf("[EXPORT] Response cookie '%s' domain from Set-Cookie: %s (hostOnly: false)", cookie.Name, domain)
-		}
-
-		// Use cookie.Path as-is
-		path := cookie.Path
-		if path == "" {
-			path = "/"
-		}
-
-		etcCookie := EditThisCookieExport{
-			Domain:         domain,
-			ExpirationDate: 0, // Default to 0 for session cookies
-			HostOnly:       hostOnly,
-			HttpOnly:       cookie.HttpOnly,
-			Name:           cookie.Name,
-			Path:           path,
-			SameSite:       sameSite,
-			Secure:         cookie.Secure,
-			Session:        cookie.MaxAge == 0 && cookie.Expires.IsZero(),
-			StoreId:        "0",
-			Value:          cookie.Value,
-		}
-
-		// Set expiration date as float (Unix timestamp with milliseconds)
-		if !cookie.Expires.IsZero() {
-			etcCookie.ExpirationDate = float64(cookie.Expires.Unix()) + float64(cookie.Expires.Nanosecond())/1e9
-		}
-
-		// Add to map (overwrites if duplicate)
-		key := etcCookie.Name + "|" + etcCookie.Domain
-		cookieMap[key] = etcCookie
-	}
-
-	// Convert map back to array
-	exportData = make([]EditThisCookieExport, 0, len(cookieMap))
-	for _, cookie := range cookieMap {
-		exportData = append(exportData, cookie)
-	}
-
-	// Write back with error handling
-	jsonData, err := json.MarshalIndent(exportData, "", "    ")
-	if err != nil {
-		log.Printf("[EXPORT] ERROR: Failed to marshal JSON: %v", err)
-		return
-	}
-
-	err = os.WriteFile(filename, jsonData, 0644)
-	if err != nil {
-		log.Printf("[EXPORT] ERROR: Failed to write file %s: %v", filename, err)
-		return
-	}
-
-	log.Printf("[EXPORT] ✓ %d unique cookies in %s", len(exportData), filename)
-}
-
 func logRequest(req *http.Request, config *ProxyConfig) {
-	// Check if any module wants to log this request
 	shouldLog := executeModules(req)
 	
 	if !shouldLog {
@@ -1395,87 +1976,6 @@ func logRequest(req *http.Request, config *ProxyConfig) {
 		}
 	}
 
-	// Verbose mode: Show detailed cookie and session information
-	if config.Verbose {
-		// Export to EditThisCookie format
-		exportToEditThisCookie(req)
-		
-		logEntry = logEntry + "\n--- VERBOSE: Cookie & Session Details ---\n"
-		
-		// Parse and display cookies
-		cookies := req.Cookies()
-		if len(cookies) > 0 {
-			logEntry = logEntry + fmt.Sprintf("Cookies (%d total):\n", len(cookies))
-			for _, cookie := range cookies {
-				logEntry = logEntry + fmt.Sprintf("  [Cookie] %s\n", cookie.Name)
-				logEntry = logEntry + fmt.Sprintf("    Value: %s\n", cookie.Value)
-				logEntry = logEntry + fmt.Sprintf("    Path: %s\n", cookie.Path)
-				logEntry = logEntry + fmt.Sprintf("    Domain: %s\n", cookie.Domain)
-				if !cookie.Expires.IsZero() {
-					logEntry = logEntry + fmt.Sprintf("    Expires: %s\n", cookie.Expires.Format(time.RFC3339))
-				}
-				if cookie.MaxAge > 0 {
-					logEntry = logEntry + fmt.Sprintf("    MaxAge: %d seconds\n", cookie.MaxAge)
-				}
-				logEntry = logEntry + fmt.Sprintf("    Secure: %v\n", cookie.Secure)
-				logEntry = logEntry + fmt.Sprintf("    HttpOnly: %v\n", cookie.HttpOnly)
-				if cookie.SameSite != 0 {
-					logEntry = logEntry + fmt.Sprintf("    SameSite: %v\n", cookie.SameSite)
-				}
-				
-				// Try to decode JWT if it looks like one
-				if isJWT(cookie.Value) {
-					logEntry = logEntry + parseJWT(cookie.Value)
-				}
-				logEntry = logEntry + "\n"
-			}
-		} else {
-			logEntry = logEntry + "Cookies: None\n"
-		}
-		
-		// Display Authorization header details
-		if authHeader := req.Header.Get("Authorization"); authHeader != "" {
-			logEntry = logEntry + "\n[Authorization Header]\n"
-			logEntry = logEntry + fmt.Sprintf("  Full Value: %s\n", authHeader)
-			
-			// Parse Bearer tokens
-			if strings.HasPrefix(authHeader, "Bearer ") {
-				token := strings.TrimPrefix(authHeader, "Bearer ")
-				logEntry = logEntry + fmt.Sprintf("  Type: Bearer Token\n")
-				logEntry = logEntry + fmt.Sprintf("  Token: %s\n", token)
-				
-				// Try to decode JWT
-				if isJWT(token) {
-					logEntry = logEntry + parseJWT(token)
-				}
-			} else if strings.HasPrefix(authHeader, "Basic ") {
-				logEntry = logEntry + fmt.Sprintf("  Type: Basic Authentication\n")
-				logEntry = logEntry + "  (Base64 encoded credentials)\n"
-			} else if strings.HasPrefix(authHeader, "Digest ") {
-				logEntry = logEntry + fmt.Sprintf("  Type: Digest Authentication\n")
-			}
-		}
-		
-		// Display other session-related headers
-		sessionHeaders := []string{
-			"X-Auth-Token", "X-API-Key", "X-Session-ID", "X-CSRF-Token",
-			"X-Request-ID", "X-Correlation-ID", "X-Access-Token",
-		}
-		
-		hasSessionHeaders := false
-		for _, header := range sessionHeaders {
-			if value := req.Header.Get(header); value != "" {
-				if !hasSessionHeaders {
-					logEntry = logEntry + "\n[Session-Related Headers]\n"
-					hasSessionHeaders = true
-				}
-				logEntry = logEntry + fmt.Sprintf("  %s: %s\n", header, value)
-			}
-		}
-		
-		logEntry = logEntry + "--- END VERBOSE ---\n\n"
-	}
-
 	if req.Method == http.MethodPost || req.Method == http.MethodPut {
 		bodyBytes, err := io.ReadAll(req.Body)
 		if err == nil {
@@ -1483,7 +1983,6 @@ func logRequest(req *http.Request, config *ProxyConfig) {
 
 			contentType := req.Header.Get("Content-Type")
 			
-			// Check if content is binary
 			if isBinaryContent(bodyBytes) {
 				logEntry = logEntry + fmt.Sprintf("Body: [Binary data, %d bytes]\n", len(bodyBytes))
 			} else if strings.Contains(contentType, "application/x-www-form-urlencoded") {
@@ -1497,18 +1996,19 @@ func logRequest(req *http.Request, config *ProxyConfig) {
 					}
 				}
 			} else if len(bodyBytes) > 0 {
-				// Full body logging - no truncation
+				maxBodySize := 10240
 				bodyStr := string(bodyBytes)
+				if len(bodyBytes) > maxBodySize {
+					bodyStr = string(bodyBytes[:maxBodySize]) + fmt.Sprintf("... [truncated, %d more bytes]", len(bodyBytes)-maxBodySize)
+				}
 				logEntry = logEntry + fmt.Sprintf("Body: %s\n", bodyStr)
 			}
 		}
 	}
 
-	// Sanitize for console output (prevent beeping)
 	consoleEntry := sanitizeForConsole(logEntry)
 	fmt.Print(consoleEntry)
 
-	// Write raw data to file
 	logWriter.WriteString(logEntry)
 }
 
@@ -1538,17 +2038,13 @@ func getCertForHost(host string) *tls.Certificate {
 func generateCertForHost(hostname string) *tls.Certificate {
 	serialNumber, _ := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
 
-	// Build SAN entries
 	sanDNSNames := []string{hostname}
 	sanIPAddresses := []net.IP{}
 
-	// Add default SANs from config
 	for _, san := range certConfig.DefaultSANs {
-		// Check if it's an IP address
 		if ip := net.ParseIP(san); ip != nil {
 			sanIPAddresses = append(sanIPAddresses, ip)
 		} else {
-			// Add as DNS name if not already present
 			isDuplicate := false
 			for _, existing := range sanDNSNames {
 				if existing == san {
@@ -1562,12 +2058,10 @@ func generateCertForHost(hostname string) *tls.Certificate {
 		}
 	}
 
-	// Check if hostname is an IP address
 	if ip := net.ParseIP(hostname); ip != nil {
 		sanIPAddresses = append(sanIPAddresses, ip)
 	}
 
-	// Add wildcard if hostname has subdomain
 	if strings.Count(hostname, ".") > 1 {
 		parts := strings.SplitN(hostname, ".", 2)
 		wildcard := fmt.Sprintf("*.%s", parts[1])
@@ -1588,12 +2082,10 @@ func generateCertForHost(hostname string) *tls.Certificate {
 		IPAddresses: sanIPAddresses,
 	}
 
-	// Add CRL Distribution Points if configured and enabled
 	if certConfig.IncludeCDPInHosts && len(certConfig.CRLDistPoints) > 0 {
 		template.CRLDistributionPoints = certConfig.CRLDistPoints
 	}
 
-	// Add OCSP/AIA if configured and enabled
 	if certConfig.IncludeAIAInHosts {
 		if certConfig.AIAURLs != "" {
 			parts := strings.Split(certConfig.AIAURLs, "|")
@@ -1643,7 +2135,6 @@ func installCertificate(certPath string) error {
 }
 
 func installCertWindows(certPath string) error {
-	// Check if certutil exists
 	_, err := exec.LookPath("certutil")
 	if err != nil {
 		return fmt.Errorf("certutil not found in PATH - manual installation required")
@@ -1655,7 +2146,6 @@ func installCertWindows(certPath string) error {
 	cmd := exec.Command("certutil", "-addstore", "-user", "Root", certPath)
 	output, err := cmd.CombinedOutput()
 	
-	// Always show output for debugging
 	if len(output) > 0 {
 		log.Printf("certutil output: %s", string(output))
 	}
@@ -1664,7 +2154,6 @@ func installCertWindows(certPath string) error {
 		return fmt.Errorf("certutil failed: %v - %s", err, string(output))
 	}
 	
-	// Verify installation
 	log.Printf("Verifying certificate installation...")
 	verifyCmd := exec.Command("certutil", "-user", "-verifystore", "Root", "TLS Proxy Root CA")
 	verifyOutput, verifyErr := verifyCmd.CombinedOutput()
@@ -1692,7 +2181,6 @@ func installCertMacOS(certPath string) error {
 func installCertLinux(certPath string) error {
 	destPath := "/usr/local/share/ca-certificates/tlsproxy.crt"
 	
-	// Copy certificate
 	input, err := os.ReadFile(certPath)
 	if err != nil {
 		return err
@@ -1704,7 +2192,6 @@ func installCertLinux(certPath string) error {
 		return fmt.Errorf("failed to copy certificate: %v", err)
 	}
 	
-	// Update CA certificates
 	cmd = exec.Command("sudo", "update-ca-certificates")
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -1782,9 +2269,6 @@ func printManualInstallInstructions(certPath string) {
 		log.Println("  3. Store Location: 'Current User'")
 		log.Println("  4. Place in: 'Trusted Root Certification Authorities'")
 		log.Println("  5. Click 'Next' and 'Finish'")
-		log.Println("")
-		log.Println("To verify installation:")
-		log.Println("  certutil -user -verifystore Root \"TLS Proxy Root CA\"")
 		log.Println("")
 	case "darwin":
 		log.Println("")
